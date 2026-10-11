@@ -66,6 +66,19 @@ export function desktopHandedOff(state: CliUpdateState): boolean {
   return state.desktop?.state === 'done' && state.desktop.code === 'ok'
 }
 
+/// Whether the update badge has anything to say. A Store package leaves the app's own update
+/// to the Store, but the global CLI is not the Store's, so a CLI update is still offered.
+export function updateOffered(status: {
+  storeManaged: boolean
+  updateAvailable: boolean
+  cliUpdateAvailable: boolean
+  error: string | null
+} | null): boolean {
+  if (!status) return false
+  if (status.storeManaged) return status.cliUpdateAvailable
+  return status.updateAvailable || status.cliUpdateAvailable || status.error !== null
+}
+
 export type CliUpdateNote = {
   text: string
   /// What to run by hand when the update did not go through.

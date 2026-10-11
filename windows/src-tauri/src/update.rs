@@ -13,8 +13,9 @@
 //! and refuses it unless the signature verifies, and `install` runs it. Without the key, and on
 //! Linux, an available update is answered with a release page and a command to run by hand.
 //!
-//! Inside a Store package nothing is offered at all: the Store owns the update, and an .msi
-//! install underneath it would be undone by the next one.
+//! Inside a Store package the app itself is never offered: the Store owns its update, and an
+//! .msi install underneath it would be undone by the next one. The global CLI is not the
+//! Store's, so it is still checked and updated, through `codeburn update`.
 //!
 //! The check runs here rather than in the page for two reasons: the answer has to survive a
 //! popover that is closed most of the time, and the webview's CSP has no business reaching
@@ -227,7 +228,8 @@ pub struct UpdateStatus {
     pub failure_stage: Option<FailureStage>,
     pub error: Option<String>,
     /// Running inside an installed MSIX/AppX package, where the Store owns updates and this
-    /// checker has nothing to offer. Every update surface hides itself on it.
+    /// checker offers no app update. The app update surfaces hide themselves on it; a CLI
+    /// update is still offered.
     pub store_managed: bool,
     /// A verified update is downloaded and waits for Restart to Update.
     pub ready_to_install: bool,
@@ -379,10 +381,12 @@ async fn installed_cli_version(cli: &CodeburnCli) -> Option<String> {
 /// which is what makes this cheap to call on every mount.
 pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateStatus {
     // Inside a package the Store is the updater. Running this one there would offer an .msi
-    // install that MSIX would either refuse or quietly undo on its next update, so the check
-    // never happens: no request, no `codeburn --version` spawn, no cache file.
+    // install that MSIX would either refuse or quietly undo on its next update, so GitHub is
+    // never asked. The global CLI still gets its check, from the engine.
     if is_packaged_app() {
-        return UpdateStatus::store_managed(app.package_info().version.to_string());
+        let mut status = UpdateStatus::store_managed(app.package_info().version.to_string());
+        store_cli_check(cli, force, &mut status).await;
+        return status;
     }
 
     let mut status = UpdateStatus::new(app.package_info().version.to_string());
@@ -428,6 +432,81 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
     }
     status.recompute();
     status
+}
+
+/// The global CLI's `(installed, latest, code)` from the `result` line of
+/// `codeburn update --check --cli --json`. None when no result came back: a CLI that predates
+/// the engine, which is then offered nothing.
+fn engine_cli_check(
+    lines: &[serde_json::Value],
+) -> Option<(Option<String>, Option<String>, String)> {
+    let result = lines.iter().rev().find(|line| line["type"] == "result")?;
+    let cli = &result["components"]["cli"];
+    let text = |key: &str| cli[key].as_str().map(str::to_owned);
+    Some((
+        text("installed"),
+        text("latest"),
+        text("code").unwrap_or_default(),
+    ))
+}
+
+/// The Store branch's CLI check. A fresh cache answers `latest` and `--local` (no network)
+/// reads what is installed, so opening the popover does not cost an npm registry hit.
+async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStatus) {
+    let cached = read_cache().unwrap_or_default();
+    let fresh = !force && is_fresh(cached.checked_at);
+    let args: &[&str] = if fresh {
+        &["--check", "--local", "--cli"]
+    } else {
+        &["--check", "--cli"]
+    };
+    let mut lines = Vec::new();
+    if let Err(err) = cli
+        .run_update_json(args, |line| {
+            if let Ok(value) = serde_json::from_str(line) {
+                lines.push(value);
+            }
+        })
+        .await
+    {
+        crate::log_line!("codeburn: CLI update check failed: {err}");
+    }
+    apply_store_cli_check(status, engine_cli_check(&lines), fresh, &cached);
+    if !fresh && status.latest_cli_version.is_some() && status.checked_at.is_none() {
+        let checked_at = now_secs();
+        let entry = Cached {
+            checked_at,
+            latest: None,
+            latest_cli: status.latest_cli_version.clone(),
+        };
+        if let Err(err) = write_cache(&entry) {
+            crate::log_line!("codeburn: failed to cache the update check: {err}");
+        }
+        status.checked_at = Some(checked_at);
+    }
+}
+
+/// Pure half of `store_cli_check`. A CLI bundled with another app (`managed`) is never offered;
+/// a registry that could not be read keeps whatever the cache knew.
+fn apply_store_cli_check(
+    status: &mut UpdateStatus,
+    check: Option<(Option<String>, Option<String>, String)>,
+    fresh: bool,
+    cached: &Cached,
+) {
+    let Some((installed, latest, code)) = check else {
+        return;
+    };
+    status.installed_cli_version = installed;
+    if code == "managed" {
+        status.latest_cli_version = None;
+    } else if fresh || latest.is_none() {
+        status.latest_cli_version = cached.latest_cli.clone();
+        status.checked_at = (cached.checked_at > 0).then_some(cached.checked_at);
+    } else {
+        status.latest_cli_version = latest;
+    }
+    status.recompute();
 }
 
 // One-click install ----------------------------------------------------------------------------
@@ -731,6 +810,71 @@ mod tests {
         assert_eq!(status.latest_version, None);
         assert_eq!(status.checked_at, None);
         assert_eq!(status.failure_stage, None);
+    }
+
+    #[test]
+    fn a_store_install_still_offers_the_global_cli() {
+        let lines: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type":"step","component":"cli","state":"skipped","code":"ok"}),
+            serde_json::json!({"type":"result","ok":true,"components":{"cli":{"installed":"0.9.26","latest":"0.9.27","state":"skipped","code":"ok","method":"npm"}}}),
+        ];
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            engine_cli_check(&lines),
+            false,
+            &Cached::default(),
+        );
+        assert!(status.store_managed);
+        assert_eq!(status.install_route, InstallRoute::Store);
+        assert!(!status.update_available);
+        assert!(status.cli_update_available);
+        assert_eq!(status.latest_cli_version.as_deref(), Some("0.9.27"));
+    }
+
+    #[test]
+    fn a_store_cli_check_uses_the_cache_when_fresh_and_skips_managed_or_old_clis() {
+        let cached = Cached {
+            checked_at: 1,
+            latest: None,
+            latest_cli: Some("0.9.27".into()),
+        };
+        let local = |code: &str| {
+            Some((
+                Some("0.9.26".to_owned()),
+                Some("0.9.26".to_owned()),
+                code.to_owned(),
+            ))
+        };
+
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(&mut status, local("up_to_date"), true, &cached);
+        assert!(status.cli_update_available);
+
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(&mut status, local("managed"), true, &cached);
+        assert!(!status.cli_update_available);
+
+        // The registry did not answer: the cache still stands.
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            Some((Some("0.9.26".into()), None, "download_fail".into())),
+            false,
+            &cached,
+        );
+        assert!(status.cli_update_available);
+
+        // A CLI without the engine prints no result line.
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            engine_cli_check(&[serde_json::json!({"type":"other"})]),
+            false,
+            &cached,
+        );
+        assert!(!status.cli_update_available);
+        assert_eq!(status.installed_cli_version, None);
     }
 
     /// This test binary is an ordinary .exe, which is the branch every developer machine and

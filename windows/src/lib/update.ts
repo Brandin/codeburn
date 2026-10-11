@@ -16,7 +16,7 @@ import { openUrl } from '@tauri-apps/plugin-opener'
 
 import { t } from './i18n'
 import {
-  EMPTY_CLI_UPDATE, applyEngineLine, desktopHandedOff, type CliUpdateState,
+  EMPTY_CLI_UPDATE, applyEngineLine, desktopHandedOff, updateOffered, type CliUpdateState,
 } from './cliUpdate'
 
 /// UpdateFailureStage: the check, or a one-click download that failed and fell back to manual.
@@ -264,7 +264,7 @@ export function helpText(state: UpdateState): string {
 /// opens its release page; anything else asks GitHub again.
 export function badgeAction(state: UpdateState): 'check' | 'download' | 'update' | 'restart' | 'cli' {
   const status = state.status
-  if (!status?.updateAvailable) return status?.cliUpdateAvailable && !status.storeManaged ? 'cli' : 'check'
+  if (!status?.updateAvailable) return status?.cliUpdateAvailable ? 'cli' : 'check'
   if (status.installRoute !== 'oneClick') return 'download'
   return status.readyToInstall ? 'restart' : 'update'
 }
@@ -279,8 +279,5 @@ export function runUpdateAction(action: ReturnType<typeof badgeAction>, status: 
 }
 
 export function badgeVisible(state: UpdateState): boolean {
-  const status = state.status
-  if (!status) return false
-  if (status.storeManaged) return false
-  return status.updateAvailable || status.cliUpdateAvailable || status.error !== null
+  return updateOffered(state.status)
 }

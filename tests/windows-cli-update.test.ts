@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  EMPTY_CLI_UPDATE, applyEngineLine, describeCliUpdate, desktopHandedOff, parseEngineLine,
+  EMPTY_CLI_UPDATE, applyEngineLine, describeCliUpdate, desktopHandedOff, parseEngineLine, updateOffered,
   type CliUpdateState,
 } from '../windows/src/lib/cliUpdate'
 
@@ -69,6 +69,15 @@ describe('tray CLI update decoding', () => {
       failed: true,
     })
     expect(describeCliUpdate(EMPTY_CLI_UPDATE, t, '')).toBeNull()
+  })
+
+  it('a Store install still offers a CLI update, and nothing else', () => {
+    const base = { storeManaged: true, updateAvailable: false, cliUpdateAvailable: false, error: null }
+    expect(updateOffered(null)).toBe(false)
+    expect(updateOffered(base)).toBe(false)
+    expect(updateOffered({ ...base, cliUpdateAvailable: true })).toBe(true)
+    expect(updateOffered({ ...base, error: 'GitHub said no' })).toBe(false)
+    expect(updateOffered({ ...base, storeManaged: false, error: 'GitHub said no' })).toBe(true)
   })
 
   it('every sentence the decoder uses is in both tray catalogs', async () => {

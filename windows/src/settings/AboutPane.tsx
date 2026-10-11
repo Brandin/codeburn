@@ -45,7 +45,7 @@ export function AboutPane({ anchor }: Props) {
   const status = update.status
   const storeManaged = status?.storeManaged ?? false
   const appUpdate = (status?.updateAvailable ?? false) && !storeManaged
-  const cliUpdate = (status?.cliUpdateAvailable ?? false) && !storeManaged
+  const cliUpdate = status?.cliUpdateAvailable ?? false
   const oneClick = status?.installRoute === 'oneClick'
   const action = badgeAction(update)
   const cliNote = describeCliUpdate(update.cliUpdate, t, status?.cliUpdateCommand ?? '')
@@ -191,7 +191,10 @@ function resultNote(update: UpdateState): string {
   const status = update.status
   if (!status) return update.checking ? 'Checking GitHub for a newer release...' : ''
   if (status.storeManaged) {
-    return 'This copy came from the Microsoft Store, which keeps it up to date. There is nothing to check here.'
+    const store = 'This copy came from the Microsoft Store, which keeps it up to date.'
+    return status.cliUpdateAvailable && status.latestCliVersion
+      ? `${store} CLI ${status.latestCliVersion} is available (you have ${status.installedCliVersion ?? 'none'}).`
+      : `${store} There is nothing to check here.`
   }
   if (status.error) return `${status.failureStage === 'install' ? 'Update failed.' : 'Check failed.'} ${status.error}`
   const parts: string[] = []
