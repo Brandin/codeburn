@@ -154,7 +154,8 @@ export function createCompanionUpdater(deps: CompanionUpdateDeps) {
       if (!result.ok && !all.some(step => step.state === 'error')) {
         // The engine stopped without saying why: a crash, a kill or the timeout.
         const last = result.stderr.trim().split('\n').pop()?.slice(0, 200)
-        steps.cli = { state: 'error', code: 'install_fail', message: last || 'The update did not finish.' }
+        const unfinished = (['menubar', 'cli'] as const).find(c => steps[c]?.state === 'start' || steps[c]?.state === 'progress') ?? 'cli'
+        steps[unfinished] = { state: 'error', code: 'install_fail', message: last || 'The update did not finish.' }
       }
       const final = Object.values(steps)
       const state = final.some(step => step.state === 'error') ? 'error'

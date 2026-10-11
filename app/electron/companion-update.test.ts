@@ -192,6 +192,15 @@ describe('createCompanionUpdater', () => {
     await updater.start()
     expect(updater.status()).toMatchObject({ state: 'error', steps: { cli: { state: 'error', message: 'codeburn update timed out after 900000ms' } } })
     expect(tracked).toEqual([])
+
+    // A kill mid-menubar blames the menubar, not a CLI that already updated.
+    const midway = fakeEngine([
+      step({ component: 'cli', state: 'done', code: 'ok', from: '0.9.25', to: '0.9.27' }),
+      step({ component: 'menubar', state: 'start', from: '0.9.25', to: '0.9.27' }),
+    ], { ok: false, code: null, stderr: 'timed out' })
+    const second = setup({ runCli: midway })
+    await second.updater.run()
+    expect(second.updater.status().steps).toMatchObject({ cli: { state: 'done' }, menubar: { state: 'error', message: 'timed out' } })
   })
 
   it('ends idle when the engine found nothing to do', async () => {
