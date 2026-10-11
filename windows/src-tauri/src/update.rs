@@ -21,12 +21,13 @@
 //! api.github.com when the fetch can be made from a place that already talks HTTPS.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::cli::CodeburnCli;
@@ -564,6 +565,64 @@ fn download_outcome(err: &anyhow::Error) -> &'static str {
     }
 }
 
+// The CLI through the engine ------------------------------------------------------------------
+
+/// Each `--json` line from `codeburn update`, re-emitted for the page to decode.
+const CLI_UPDATE_EVENT: &str = "codeburn://cli-update";
+
+static CLI_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct RunningGuard;
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        CLI_UPDATE_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One engine line as the page may see it: a `step` or `result` object, with the free text
+/// scrubbed like every other message that reaches a window. Anything else is dropped.
+fn engine_line(line: &str) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object_mut()?;
+    if !matches!(
+        object.get("type").and_then(|t| t.as_str()),
+        Some("step" | "result")
+    ) {
+        return None;
+    }
+    for key in ["message", "command"] {
+        if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
+            let scrubbed = scrub(text);
+            object.insert(key.into(), scrubbed.into());
+        }
+    }
+    Some(value)
+}
+
+/// `codeburn update --cli --desktop --json`: the global CLI, and the hand-off to an installed
+/// desktop app that the engine decides on. Progress goes out as events; the engine's lines are
+/// the only account of the outcome, so an old CLI with no `update` command (no result line)
+/// is an error here and the page falls back to the manual command.
+pub async fn update_cli(app: &AppHandle, cli: &CodeburnCli) -> Result<()> {
+    if CLI_UPDATE_RUNNING.swap(true, Ordering::SeqCst) {
+        bail!("An update is already running.");
+    }
+    let _guard = RunningGuard;
+    let mut saw_result = false;
+    cli.run_update_json(&["--cli", "--desktop"], |line| {
+        if let Some(value) = engine_line(line) {
+            saw_result |= value["type"] == "result";
+            let _ = app.emit(CLI_UPDATE_EVENT, value);
+        }
+    })
+    .await?;
+    if !saw_result {
+        bail!("The CLI did not report a result.");
+    }
+    Ok(())
+}
+
 // Scrubbing -----------------------------------------------------------------------------------
 
 fn token_len(text: &str) -> usize {
@@ -902,6 +961,20 @@ mod tests {
             download_outcome(&anyhow::anyhow!("no newer release")),
             "download_fail"
         );
+    }
+
+    #[test]
+    fn engine_lines_are_filtered_and_scrubbed() {
+        let step = engine_line(
+            r#"{"type":"step","component":"cli","state":"error","code":"permission","message":"EACCES sk-ant-api03-AbCd_1234-xyz","command":"npm i -g codeburn"}"#,
+        )
+        .expect("a step passes");
+        assert_eq!(step["message"], "EACCES sk-ant-***");
+        assert_eq!(step["command"], "npm i -g codeburn");
+        assert!(engine_line(r#"{"type":"result","ok":true,"components":{}}"#).is_some());
+        assert!(engine_line(r#"{"type":"other"}"#).is_none());
+        assert!(engine_line("npm WARN deprecated").is_none());
+        assert!(engine_line("[1,2]").is_none());
     }
 
     #[test]

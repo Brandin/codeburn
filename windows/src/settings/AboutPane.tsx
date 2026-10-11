@@ -4,9 +4,11 @@ import { openUrl } from '@tauri-apps/plugin-opener'
 
 import { Group, Note, Pane, Row } from './controls'
 import { ArrowUpRight, FLAME_PATH } from '../components/Icons'
+import { describeCliUpdate } from '../lib/cliUpdate'
 import { relativePast } from '../lib/dates'
+import { t, useI18nRevision } from '../lib/i18n'
 import {
-  EMPTY_UPDATE, badgeAction, checkUpdates, runUpdateAction, subscribeUpdate, type UpdateState,
+  EMPTY_UPDATE, badgeAction, checkUpdates, runUpdateAction, subscribeUpdate, updateCli, type UpdateState,
 } from '../lib/update'
 import { track } from '../lib/telemetry'
 
@@ -35,6 +37,7 @@ export function AboutPane({ anchor }: Props) {
     invoke<string>('app_version').then(setVersion).catch(() => {})
   }, [])
   useEffect(() => subscribeUpdate(setUpdate), [])
+  useI18nRevision()
   useEffect(() => {
     if (anchor === 'check') void checkUpdates(true)
   }, [anchor])
@@ -45,6 +48,8 @@ export function AboutPane({ anchor }: Props) {
   const cliUpdate = (status?.cliUpdateAvailable ?? false) && !storeManaged
   const oneClick = status?.installRoute === 'oneClick'
   const action = badgeAction(update)
+  const cliNote = describeCliUpdate(update.cliUpdate, t, status?.cliUpdateCommand ?? '')
+  const busy = update.downloading || update.cliUpdate.running
 
   return (
     <Pane>
@@ -76,11 +81,12 @@ export function AboutPane({ anchor }: Props) {
                 <button
                   type="button"
                   className="btn btn-prominent"
-                  disabled={update.downloading}
+                  disabled={busy}
                   onClick={() => { track('update_click', { action }); runUpdateAction(action, status) }}
                 >
                   {!oneClick ? 'Download from GitHub'
                     : status?.readyToInstall ? 'Restart to Update'
+                    : update.cliUpdate.running ? t('Updating the CLI...')
                     : update.downloading ? 'Downloading...' : 'Update'}
                 </button>
               )}
@@ -102,9 +108,25 @@ export function AboutPane({ anchor }: Props) {
             command={status.appUpdateCommand}
           />
         )}
-        {cliUpdate && status && (
-          <CommandRow label="Update the CLI" command={status.cliUpdateCommand} />
+        {cliUpdate && status && !(appUpdate && oneClick) && (
+          <Row
+            label={t('Update CLI')}
+            control={(
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => { track('update_click', { action: 'cli' }); void updateCli() }}
+              >
+                {t('Update CLI')}
+              </button>
+            )}
+          />
         )}
+        {cliNote?.command && (
+          <CommandRow label="Run it from a terminal" command={cliNote.command} />
+        )}
+        {cliNote && <Note>{cliNote.text}</Note>}
         <Note>{resultNote(update)}</Note>
       </Group>
 
