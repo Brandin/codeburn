@@ -18,7 +18,17 @@ import {
 /// Public GitHub repo that hosts macOS release builds. Normal installs use direct
 /// versioned release asset URLs; the API scan is only a fallback for missing assets.
 const RELEASE_API = 'https://api.github.com/repos/getagentseal/codeburn/releases?per_page=20'
-const RELEASE_DOWNLOAD_BASE = 'https://github.com/getagentseal/codeburn/releases/download'
+const DEFAULT_RELEASE_DOWNLOAD_BASE = 'https://github.com/getagentseal/codeburn/releases/download'
+/// `CODEBURN_RELEASE_BASE` points installs and update checks at a local feed server for the
+/// update end-to-end test. Only loopback http or another GitHub releases/download base is taken;
+/// every signature pin still applies, so an override can only offer builds we signed.
+export function resolveReleaseBase(value: string | undefined): string {
+  const loopback = /^http:\/\/127\.0\.0\.1:(\d{1,5})$/.exec(value ?? '')
+  if (loopback && Number(loopback[1]) > 0 && Number(loopback[1]) < 65536) return value!
+  if (/^https:\/\/github\.com\/[\w-]+\/[\w.-]+\/releases\/download$/.test(value ?? '')) return value!
+  return DEFAULT_RELEASE_DOWNLOAD_BASE
+}
+export const RELEASE_DOWNLOAD_BASE = resolveReleaseBase(process.env['CODEBURN_RELEASE_BASE'])
 /// Written by release-menubar.yml to the rolling `update-feeds` prerelease after a mac-v*
 /// release's assets are verified, so "latest" never depends on which release line GitHub calls Latest.
 export const MAC_FEED_URL = `${RELEASE_DOWNLOAD_BASE}/update-feeds/menubar-latest.json`
@@ -153,7 +163,7 @@ function matchesNoProxy(hostname: string, noProxy?: string): boolean {
   })
 }
 
-function fetchWithProxy(url: string, options: FetchOptions = {}) {
+export function fetchWithProxy(url: string, options: FetchOptions = {}) {
   const proxyUrl = resolveProxyUrlForUrl(url)
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
   return undiciFetch(url, dispatcher ? { ...options, dispatcher } : options)
@@ -201,6 +211,13 @@ export function resolveVersionedMenubarReleaseAssets(cliVersion: string, spec: R
     zip,
     checksum,
   }
+}
+
+/// The fallbacks can only name what is published, which trails the CLI during a release, so
+/// taking it unconditionally would replace a newer installed copy with an older one.
+export function isFallbackUpgrade(assets: ResolvedAssets, installedVersion: string | null, spec: ReleaseSpec = MAC_RELEASE): boolean {
+  if (!installedVersion) return true
+  return compareMenubarVersions(assets.release.tag_name.slice(spec.tagPrefix.length), installedVersion) > 0
 }
 
 export function shouldFallbackToReleaseApi(status: number): boolean {
@@ -713,6 +730,14 @@ async function captureCommand(command: string, args: string[]): Promise<string> 
   })
 }
 
+export async function readBundleVersion(appPath: string): Promise<string | null> {
+  return captureCommand('/usr/libexec/PlistBuddy', [
+    '-c',
+    'Print :CFBundleShortVersionString',
+    join(appPath, 'Contents', 'Info.plist'),
+  ]).catch(() => null)
+}
+
 async function verifyBundleIdentity(appPath: string): Promise<void> {
   const bundleID = await captureCommand('/usr/libexec/PlistBuddy', [
     '-c',
@@ -798,7 +823,8 @@ export async function hasRunnableRecordedCli(recordPath: string = PERSISTED_CLI_
 /// own ancestors by default, and the app's Update button runs this install as the app's
 /// child, so without it the app asking for the update is never seen (#1541).
 export async function runningAppPids(name: string = APP_PROCESS_NAME): Promise<number[]> {
-  const out = await captureCommand('/usr/bin/pgrep', ['-a', '-x', name]).catch(() => '')
+  // -U: another user's menubar (fast user switching) is not ours to stop or wait for.
+  const out = await captureCommand('/usr/bin/pgrep', ['-a', '-U', String(process.getuid!()), '-x', name]).catch(() => '')
   return out.split('\n').map(Number).filter(pid => Number.isInteger(pid) && pid > 0)
 }
 
@@ -1387,7 +1413,7 @@ export function storeAppUserModelId(installLocation: string): string | undefined
   return match ? `${match[1]}_${match[2]}!${STORE_APP_ID}` : undefined
 }
 
-async function queryStoreInstallLocation(env: NodeJS.ProcessEnv): Promise<string> {
+export async function queryStoreInstallLocation(env: NodeJS.ProcessEnv): Promise<string> {
   // Same rule msiexec and reg follow above: an absolute System32 path, never a bare name.
   const powershell = resolveSystem32Path('WindowsPowerShell\\v1.0\\powershell.exe', env)
   return captureBounded(powershell, [
@@ -1608,6 +1634,10 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
       if (!cliVersion || !isMissingDirectAssetError(err)) throw err
       log(`CodeBurn Menubar v${cliVersion} assets were not found. Looking up the latest CodeBurn Menubar release...`)
       assets = await fetchLatestReleaseAssets(WINDOWS_RELEASE, hooks.apiFetch)
+      if (installed && !isFallbackUpgrade(assets, installed.version, WINDOWS_RELEASE)) {
+        log(`The newest published CodeBurn Menubar (${assets.release.tag_name}) is not newer than the installed ${installed.version}; leaving it alone.`)
+        return { installedPath: installed.exePath, launched: false }
+      }
       msiPath = await stageWindowsInstaller(assets, stagingDir, hooks, log)
     }
 
@@ -1691,6 +1721,11 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
       if (!cliVersion || !isMissingDirectAssetError(err)) throw err
       console.log(`CodeBurn Menubar v${cliVersion} assets were not found. Looking up the latest CodeBurn Menubar release...`)
       assets = await fetchLatestMacReleaseAssets()
+      const installedVersion = installedPath ? await readBundleVersion(installedPath) : null
+      if (installedPath && !isFallbackUpgrade(assets, installedVersion)) {
+        console.log(`The newest published CodeBurn Menubar (${assets.release.tag_name}) is not newer than the installed ${installedVersion}; leaving it alone.`)
+        return { installedPath, launched: false }
+      }
       unpackedApp = await stageMenubarApp(assets, stagingDir)
     }
 
