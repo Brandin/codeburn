@@ -855,21 +855,34 @@ async function killRunningApp(pids: number[]): Promise<void> {
 }
 
 /// Runs detached in its own session, so nothing that happens to the app or to this CLI
-/// reaches it. Waits for the CLI ($1) to exit first: the app reads the CLI's stderr and waits
-/// on its exit status, so the app must outlive it. Then asks the app ($2) to go, forces it
-/// after 5s, and launches the new bundle only once no old copy is left for `open` to
-/// re-activate instead.
-const RELAUNCH_SCRIPT = `cli=$1 pids=$2; shift 2
-alive() { for p in $pids; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
-i=0; while kill -0 "$cli" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+/// reaches it. Waits for the CLI and every process between it and the app ($1) to exit first:
+/// the app reads the CLI's output and waits on its exit status, so the app must outlive them.
+/// Then asks the app ($2) to go, forces it after 5s, and launches the new bundle only once no
+/// old copy is left for `open` to re-activate instead. The 120s cap covers the desktop step
+/// that `codeburn update` runs after this install.
+const RELAUNCH_SCRIPT = `waits=$1 pids=$2; shift 2
+alive() { for p in $1; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
+i=0; while alive "$waits" && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done
 kill -TERM $pids 2>/dev/null
-i=0; while alive && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+i=0; while alive "$pids" && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 kill -KILL $pids 2>/dev/null
-i=0; while alive && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+i=0; while alive "$pids" && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
 exec "$@"`
 
-async function relaunchAfterExit(appPids: number[], launch: string[]): Promise<void> {
-  const child = spawn('/bin/sh', ['-c', RELAUNCH_SCRIPT, 'codeburn-relaunch', String(process.pid), appPids.join(' '), ...launch], {
+/// This process and every ancestor below the app. After a CLI update `codeburn update` re-runs
+/// itself, so the app's own child is the parent engine, which still prints the final result
+/// once this process has exited.
+export function pidsBelowApp(pid: number, appPids: number[], ancestors: Set<number>): number[] {
+  const out = [pid]
+  for (const p of ancestors) {
+    if (appPids.includes(p)) break
+    out.push(p)
+  }
+  return out
+}
+
+async function relaunchAfterExit(waitPids: number[], appPids: number[], launch: string[]): Promise<void> {
+  const child = spawn('/bin/sh', ['-c', RELAUNCH_SCRIPT, 'codeburn-relaunch', waitPids.join(' '), appPids.join(' '), ...launch], {
     detached: true,
     stdio: 'ignore',
   })
@@ -901,7 +914,7 @@ export async function replaceAndRelaunch(
       await placeMenubarBundle(unpackedApp, targetPath)
       // -n: the old copy is gone by now, but Launch Services can take a moment to notice,
       // and a plain `open` in that window re-activates it instead of launching anything.
-      await relaunchAfterExit(running, [...(hooks.launchCommand ?? ['/usr/bin/open', '-n']), targetPath])
+      await relaunchAfterExit(pidsBelowApp(process.pid, running, ancestors), running, [...(hooks.launchCommand ?? ['/usr/bin/open', '-n']), targetPath])
       console.log('CodeBurn Menubar will restart into the new version.')
       return
     }
