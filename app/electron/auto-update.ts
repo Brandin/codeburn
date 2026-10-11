@@ -9,6 +9,8 @@ import { compareSemver, type UpdateChecker, type UpdateStatus } from './updates'
 export const WINDOWS_AUTO_UPDATE = false
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+// quitAndInstall normally quits within seconds; still running after this, it is not going to.
+const INSTALL_TIMEOUT_MS = 60_000
 
 export function autoUpdateSupported(env: {
   platform: string
@@ -38,7 +40,7 @@ export type Updater = {
   checkForUpdates(): Promise<{ updateInfo: { version: string } } | null>
   downloadUpdate(): Promise<unknown>
   quitAndInstall(): void
-  on(event: 'update-downloaded', listener: () => void): unknown
+  on(event: 'update-downloaded' | 'error', listener: (err: Error) => void): unknown
 }
 
 export type AutoUpdateChecker = UpdateChecker & {
@@ -68,6 +70,10 @@ export function createAutoUpdateChecker(opts: {
   /** Runs before quitAndInstall: the quit flush, done here because a before-quit handler that
    *  defers the quit would cancel the one quitAndInstall starts. */
   beforeQuit?: () => Promise<void>
+  /** quitAndInstall failed (Squirrel refused the bundle) or the app is still running after the
+   *  timeout: restore what beforeQuit stopped. The banner then offers a retry. */
+  onInstallFail?: () => void
+  installTimeoutMs?: number
 }): AutoUpdateChecker {
   const { updater, currentVersion, onChange } = opts
   const now = opts.now ?? (() => Date.now())
@@ -77,16 +83,33 @@ export function createAutoUpdateChecker(opts: {
   let lastCheckedAt = 0
   let inflight: Promise<UpdateStatus> | null = null
   let installing = false
+  let installTimer: ReturnType<typeof setTimeout> | undefined
 
   const set = (next: UpdateStatus) => { status = next; onChange(status) }
+
+  const failInstall = () => {
+    if (!installing) return
+    installing = false
+    clearTimeout(installTimer)
+    set({ ...status, installFailed: true })
+    opts.onInstallFail?.()
+  }
 
   const install = async () => {
     if (status.install !== 'ready' || installing) return
     installing = true
+    if (status.installFailed) {
+      const { installFailed: _retrying, ...rest } = status
+      set(rest)
+    }
     opts.onInstall?.(currentVersion, status.latestVersion ?? '')
     try { await opts.beforeQuit?.() } catch { /* the install goes ahead without the flush */ }
-    updater.quitAndInstall()
+    installTimer = setTimeout(failInstall, opts.installTimeoutMs ?? INSTALL_TIMEOUT_MS)
+    try { updater.quitAndInstall() } catch { failInstall() }
   }
+
+  // Only while installing: electron-updater also emits error for an offline check.
+  updater.on('error', failInstall)
 
   // Nothing downloads without a click (or the hand-off from another surface), so a finished
   // download restarts straight into the update; `ready` is what the banner shows meanwhile.

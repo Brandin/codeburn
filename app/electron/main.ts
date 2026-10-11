@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, powerMonitor, s
 import path from 'node:path'
 
 import { createBridgeHandlers as createHandlers, NO_UPDATE_STATUS, type Deps, type Handler } from './bridge-handlers'
-import { reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe } from './cli'
+import { killAll, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe } from './cli'
 import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL } from './menubar'
 import { MacMenubar, type InstallPhase } from './mac-menubar'
 import { getQuota } from './quota'
@@ -91,7 +91,12 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
  * before-quit, and a handler that defers that quit cancels it, so the install flushes up front
  * and every quit after that passes straight through.
  */
-export function createQuitPath(deps: BeforeQuitDeps): { beforeQuit: (event: BeforeQuitEvent) => void; beforeInstall: () => Promise<void> } {
+export function createQuitPath(deps: BeforeQuitDeps): {
+  beforeQuit: (event: BeforeQuitEvent) => void
+  beforeInstall: () => Promise<void>
+  /** The install did not quit the app: the next quit flushes again. */
+  cancelInstall: () => void
+} {
   let installing = false
   const handler = createBeforeQuitHandler(deps)
   return {
@@ -100,6 +105,7 @@ export function createQuitPath(deps: BeforeQuitDeps): { beforeQuit: (event: Befo
       await flushForQuit(deps)
       installing = true
     },
+    cancelInstall: () => { installing = false },
   }
 }
 
@@ -441,6 +447,12 @@ function bootstrap(): void {
         onDownloadFail: (outcome, from, to) => telemetryInstance?.track('update_result', { from, to, outcome }),
         onInstall: (from, to) => telemetryInstance?.noteUpdateInstall(from, to),
         beforeQuit: quitPath.beforeInstall,
+        // The app is still here: undo the quit flush so the CLI and serve work again.
+        onInstallFail: () => {
+          quitPath.cancelInstall()
+          killAll()
+          startServe(servePidFile)
+        },
       })
       updateChecker = autoUpdate
     } else {

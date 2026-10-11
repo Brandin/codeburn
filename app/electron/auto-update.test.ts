@@ -4,14 +4,15 @@ import { autoUpdateSupported, createAutoUpdateChecker, downloadFailOutcome, rele
 import type { UpdateStatus } from './updates'
 
 function fakeUpdater(version: string | null) {
-  let downloaded: () => void = () => {}
+  const listeners: Record<string, (err: Error) => void> = {}
   const updater = {
     autoDownload: true,
     checkForUpdates: vi.fn(async () => (version ? { updateInfo: { version } } : null)),
-    downloadUpdate: vi.fn(async () => { downloaded() }),
+    downloadUpdate: vi.fn(async () => { listeners['update-downloaded']?.(new Error('unused')) }),
     quitAndInstall: vi.fn(),
-    on: vi.fn((_event: 'update-downloaded', listener: () => void) => { downloaded = listener }),
-  } satisfies Updater
+    on: vi.fn((event: 'update-downloaded' | 'error', listener: (err: Error) => void) => { listeners[event] = listener }),
+    emitError: (err: Error) => listeners.error?.(err),
+  } satisfies Updater & { emitError: (err: Error) => void }
   return updater
 }
 
@@ -84,6 +85,52 @@ describe('createAutoUpdateChecker', () => {
     await second.check()
     await second.download()
     await vi.waitFor(() => expect(failing.quitAndInstall).toHaveBeenCalledTimes(1))
+  })
+
+  it('leaves "ready" for a retry when Squirrel refuses the bundle, and restores what the quit stopped', async () => {
+    const updater = fakeUpdater('0.9.27')
+    const onInstallFail = vi.fn()
+    const seen: UpdateStatus[] = []
+    const checker = createAutoUpdateChecker({ updater, currentVersion: '0.9.26', onChange: s => seen.push(s), onInstallFail })
+    await checker.check()
+    // An offline check also emits error; it must not count as a failed install.
+    updater.emitError(new Error('net::ERR_INTERNET_DISCONNECTED'))
+    expect(onInstallFail).not.toHaveBeenCalled()
+
+    await checker.download()
+    await vi.waitFor(() => expect(updater.quitAndInstall).toHaveBeenCalledTimes(1))
+    updater.emitError(new Error('Code signature at URL file:///x did not pass validation'))
+    expect(onInstallFail).toHaveBeenCalledTimes(1)
+    expect(seen.at(-1)).toMatchObject({ install: 'ready', installFailed: true })
+
+    // Retry: the same downloaded update, a fresh attempt, and the error flag cleared meanwhile.
+    checker.install()
+    await vi.waitFor(() => expect(updater.quitAndInstall).toHaveBeenCalledTimes(2))
+    expect(seen.at(-1)?.installFailed).toBeUndefined()
+    updater.emitError(new Error('again'))
+    expect(onInstallFail).toHaveBeenCalledTimes(2)
+  })
+
+  it('gives up waiting after 60 seconds when the app is still running', async () => {
+    vi.useFakeTimers()
+    try {
+      const updater = fakeUpdater('0.9.27')
+      const onInstallFail = vi.fn()
+      const checker = createAutoUpdateChecker({ updater, currentVersion: '0.9.26', onChange: () => {}, onInstallFail })
+      await checker.check()
+      await checker.download()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(updater.quitAndInstall).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(onInstallFail).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(onInstallFail).toHaveBeenCalledTimes(1)
+      // A late error from the same attempt does not restore twice.
+      updater.emitError(new Error('late'))
+      expect(onInstallFail).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('offers nothing when the feed is not newer', async () => {

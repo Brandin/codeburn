@@ -20,6 +20,14 @@ function writeDismissed(key: string, value: string): void {
  *  downloads and then restarts on its own, else Download, which opens the release via openExternal. */
 export function UpdateAction({ status, downloadLabel }: { status: UpdateStatus; downloadLabel: string }) {
   if (status.install === 'downloading') return <span>{t('shared.update.downloading')}</span>
+  if (status.install === 'ready' && status.installFailed) {
+    return (
+      <span>
+        {t('shared.update.installFailed')}{' '}
+        <button type="button" className="set-text-button" onClick={() => { void codeburn.installUpdate?.() }}>{t('shared.update.retry')}</button>
+      </span>
+    )
+  }
   if (status.install === 'ready') return <span>{t('shared.update.restarting')}</span>
   if (status.install === 'available' && codeburn.downloadUpdate) {
     return <button type="button" className="set-text-button" onClick={() => { void codeburn.downloadUpdate?.() }}>{t('shared.update.install')}</button>

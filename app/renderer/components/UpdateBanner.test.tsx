@@ -71,6 +71,13 @@ describe('UpdateBanner', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Restarting…')
     expect(screen.queryByRole('button', { name: /restart/i })).toBeNull()
     expect(mocks.installUpdate).not.toHaveBeenCalled()
+
+    // The app did not restart: leave "Restarting…" for an error and a retry.
+    act(() => push({ ...NEWER, install: 'ready', installFailed: true }))
+    expect(screen.getByRole('status')).toHaveTextContent('The update could not be installed.')
+    expect(screen.getByRole('status')).not.toHaveTextContent('Restarting…')
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    expect(mocks.installUpdate).toHaveBeenCalledTimes(1)
   })
 
   it('does not render when the running version is current', async () => {

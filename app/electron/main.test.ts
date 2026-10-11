@@ -518,13 +518,13 @@ describe('createBeforeQuitHandler', () => {
 
 describe('createQuitPath (quitAndInstall)', () => {
   function fakeUpdater(onQuitAndInstall: () => void) {
-    let downloaded: () => void = () => {}
+    const listeners: Record<string, (err: Error) => void> = {}
     return {
       autoDownload: true,
       checkForUpdates: vi.fn(async () => ({ updateInfo: { version: '0.9.27' } })),
-      downloadUpdate: vi.fn(async () => { downloaded() }),
+      downloadUpdate: vi.fn(async () => { listeners['update-downloaded']?.(new Error('unused')) }),
       quitAndInstall: vi.fn(onQuitAndInstall),
-      on: vi.fn((_event: 'update-downloaded', listener: () => void) => { downloaded = listener }),
+      on: vi.fn((event: 'update-downloaded' | 'error', listener: (err: Error) => void) => { listeners[event] = listener }),
     } satisfies Updater
   }
 
@@ -556,6 +556,23 @@ describe('createQuitPath (quitAndInstall)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('a failed install puts the flush back on the next quit', async () => {
+    const appQuit = vi.fn()
+    const killAll = vi.fn()
+    const quitPath = createQuitPath({ getTelemetry: () => null, killAll, quit: appQuit })
+    await quitPath.beforeInstall()
+    const passThrough = { preventDefault: vi.fn() }
+    quitPath.beforeQuit(passThrough)
+    expect(passThrough.preventDefault).not.toHaveBeenCalled()
+
+    quitPath.cancelInstall()
+    const later = { preventDefault: vi.fn() }
+    quitPath.beforeQuit(later)
+    expect(later.preventDefault).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(appQuit).toHaveBeenCalledOnce())
+    expect(killAll).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the bounded flush on an ordinary quit', async () => {

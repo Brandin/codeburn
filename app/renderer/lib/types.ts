@@ -1185,6 +1185,8 @@ export type UpdateStatus = {
   storeManaged?: boolean
   /** One-click update state; absent where the banner links to a download instead. */
   install?: 'available' | 'downloading' | 'ready'
+  /** The restart into a downloaded update did not happen; the banner offers a retry. */
+  installFailed?: boolean
 }
 
 export type CompanionComponent = 'cli' | 'menubar'

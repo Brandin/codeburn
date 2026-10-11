@@ -94,6 +94,25 @@ export function parseEngineLine(line: string): { component: CompanionComponent; 
   return { component: value.component, step }
 }
 
+/** The final `{state, code}` per component from the engine's closing `result` line, or null
+ *  for any other line. These are the engine's own outcome, so they decide the banner. */
+export function parseEngineResult(line: string): Partial<Record<CompanionComponent, CompanionStep>> | null {
+  let value: Record<string, unknown>
+  try { value = JSON.parse(line) as Record<string, unknown> } catch { return null }
+  if (!value || value.type !== 'result' || !value.components || typeof value.components !== 'object') return null
+  const out: Partial<Record<CompanionComponent, CompanionStep>> = {}
+  for (const component of ['cli', 'menubar'] as const) {
+    const entry = (value.components as Record<string, Record<string, unknown> | undefined>)[component]
+    if (!entry || typeof entry.state !== 'string' || !STATES.has(entry.state)) continue
+    const step: CompanionStep = { state: entry.state as CompanionStep['state'] }
+    if (typeof entry.code === 'string') step.code = entry.code
+    if (typeof entry.installed === 'string') step.from = entry.installed
+    if (typeof entry.latest === 'string') step.to = entry.latest
+    out[component] = step
+  }
+  return out
+}
+
 /** The update_result props for a finished step, enums and version strings only. */
 export function stepTelemetry(component: CompanionComponent, step: CompanionStep): Record<string, string> | null {
   const finished = step.state === 'done' || step.state === 'error' || (step.state === 'skipped' && step.code === 'managed')
@@ -128,8 +147,10 @@ export function createCompanionUpdater(deps: CompanionUpdateDeps) {
     if (running) return running
     running = (async () => {
       const steps: CompanionUpdateStatus['steps'] = {}
+      let resultLine: ReturnType<typeof parseEngineResult> = null
       set({ ...status, state: 'running', steps: {} })
       const read = (line: string) => {
+        resultLine = parseEngineResult(line.trim()) ?? resultLine
         const parsed = parseEngineLine(line.trim())
         if (!parsed) return
         steps[parsed.component] = parsed.step
@@ -150,8 +171,19 @@ export function createCompanionUpdater(deps: CompanionUpdateDeps) {
         },
       })
       read(pending)
+      const closing: Partial<Record<CompanionComponent, CompanionStep>> | null = resultLine
+      if (closing) {
+        for (const [component, outcome] of Object.entries(closing) as [CompanionComponent, CompanionStep][]) {
+          const last = steps[component]
+          if (!last) {
+            const props = stepTelemetry(component, outcome)
+            if (props) deps.track?.(props)
+          }
+          steps[component] = { ...outcome, ...last, state: outcome.state, ...(outcome.code ? { code: outcome.code } : {}) }
+        }
+      }
       const all = Object.values(steps)
-      if (!result.ok && !all.some(step => step.state === 'error')) {
+      if (!closing && !result.ok && !all.some(step => step.state === 'error')) {
         // The engine stopped without saying why: a crash, a kill or the timeout.
         const last = result.stderr.trim().split('\n').pop()?.slice(0, 200)
         const unfinished = (['menubar', 'cli'] as const).find(c => steps[c]?.state === 'start' || steps[c]?.state === 'progress') ?? 'cli'

@@ -203,6 +203,30 @@ describe('createCompanionUpdater', () => {
     expect(second.updater.status().steps).toMatchObject({ cli: { state: 'done' }, menubar: { state: 'error', message: 'timed out' } })
   })
 
+  it('takes the final codes from the result line, and does not invent an error when one is there', async () => {
+    const result = JSON.stringify({ type: 'result', ok: false, components: {
+      cli: { installed: '0.9.25', latest: '0.9.27', state: 'done', code: 'ok', method: 'npm' },
+      menubar: { installed: '0.9.25', latest: '0.9.27', state: 'error', code: 'install_fail' },
+    } })
+    const runCli = fakeEngine([
+      step({ component: 'cli', state: 'start', from: '0.9.25', to: '0.9.27' }),
+      step({ component: 'cli', state: 'done', code: 'ok', from: '0.9.25', to: '0.9.27', message: 'Updated' }),
+      result,
+    ], { ok: false, code: 1, stderr: 'noise' })
+    const { updater, tracked } = setup({ runCli })
+    await updater.run()
+    expect(updater.status()).toMatchObject({
+      state: 'error',
+      steps: {
+        cli: { state: 'done', code: 'ok', message: 'Updated' },
+        menubar: { state: 'error', code: 'install_fail', from: '0.9.25', to: '0.9.27' },
+      },
+    })
+    expect(updater.status().steps.menubar?.message).toBeUndefined()
+    // The menubar outcome only came in the result line, and is reported once.
+    expect(tracked.map(p => `${p.surface}:${p.outcome}`)).toEqual(['cli:ok', 'menubar:install_fail'])
+  })
+
   it('ends idle when the engine found nothing to do', async () => {
     const runCli = fakeEngine([step({ component: 'cli', state: 'skipped', code: 'up_to_date' }), RESULT])
     const { updater } = setup({ runCli })
