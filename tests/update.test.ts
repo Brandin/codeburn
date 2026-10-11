@@ -273,7 +273,7 @@ describe('runUpdate --json contract', () => {
     expect(f.runs.find(r => r[1] === 'install')).toEqual([
       '/opt/homebrew/bin/npm', 'install', '-g', 'codeburn@0.9.26', '--force', '--prefer-online', '--no-fund', '--no-audit',
     ])
-    expect(f.reexecs).toEqual([['/opt/homebrew/lib/node_modules/codeburn/dist/cli.js', 'update', '--menubar', '--desktop', '--json']])
+    expect(f.reexecs).toEqual([[join('/opt/homebrew/lib/node_modules/codeburn/dist/cli.js'), 'update', '--menubar', '--desktop', '--json']])
     const events = f.events()
     expect(events.filter(e => e.type === 'result')).toHaveLength(1)
     expect(events.map(e => [e.component, e.state])).toEqual([
