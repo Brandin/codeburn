@@ -80,6 +80,9 @@ const MSI_SUFFIX: &str = "_x64_en-US.msi";
 /// mac refuses anything below 0.9.9.
 const MIN_CLI_VERSION_FOR_UPDATE: (u32, u32, u32) = (0, 9, 21);
 
+/// The first CLI with `codeburn update`. From it on the CLI says what its own latest is.
+const MIN_CLI_VERSION_FOR_ENGINE: (u32, u32, u32) = (0, 9, 27);
+
 // The GitHub payload ---------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -134,8 +137,9 @@ pub fn resolve_latest_windows_version(releases: &[GitHubRelease]) -> Option<Stri
     None
 }
 
-/// The newest CLI release. Its tags are a bare `v<version>`, so the two platform lines
-/// (`mac-v*`, `windows-v*`) are excluded by the prefix alone.
+/// The newest CLI release, asked only of a CLI older than 0.9.27, which has no engine. Its tags
+/// are a bare `v<version>`, so the two platform lines (`mac-v*`, `windows-v*`) are excluded by
+/// the prefix alone. The release can be published before npm has the tarball.
 pub fn resolve_latest_cli_version(releases: &[GitHubRelease]) -> Option<String> {
     releases
         .iter()
@@ -153,6 +157,12 @@ fn is_newer(latest: &str, current: &str) -> bool {
         (Some(latest), Some(current)) => latest > current,
         _ => false,
     }
+}
+
+fn uses_engine(installed: Option<&str>) -> bool {
+    installed
+        .and_then(crate::cli::parse_version)
+        .is_some_and(|version| version >= MIN_CLI_VERSION_FOR_ENGINE)
 }
 
 fn is_cli_too_old(installed: Option<&str>) -> bool {
@@ -397,9 +407,25 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
     status.ready_to_install = pending().is_some();
 
     let cached = read_cache().unwrap_or_default();
-    if !force && is_fresh(cached.checked_at) {
+    let fresh = !force && is_fresh(cached.checked_at);
+    // None for a CLI without the engine, which keeps the GitHub `v*` scan below.
+    let engine_latest = if uses_engine(status.installed_cli_version.as_deref()) {
+        let answer = engine_cli_query(cli, fresh).await;
+        if let Some((installed, _, _)) = &answer {
+            status.installed_cli_version = installed.clone();
+        }
+        Some(engine_latest_cli(
+            answer.as_ref(),
+            fresh,
+            cached.latest_cli.clone(),
+        ))
+    } else {
+        None
+    };
+
+    if fresh {
         status.latest_version = cached.latest;
-        status.latest_cli_version = cached.latest_cli;
+        status.latest_cli_version = engine_latest.unwrap_or(cached.latest_cli);
         status.checked_at = Some(cached.checked_at);
         status.recompute();
         return status;
@@ -410,7 +436,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
             let fresh = Cached {
                 checked_at: now_secs(),
                 latest: resolve_latest_windows_version(&releases),
-                latest_cli: resolve_latest_cli_version(&releases),
+                latest_cli: engine_latest.unwrap_or_else(|| resolve_latest_cli_version(&releases)),
             };
             if let Err(err) = write_cache(&fresh) {
                 crate::log_line!("codeburn: failed to cache the update check: {err}");
@@ -423,7 +449,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
             // A failed check keeps whatever the cache knew, so a badge already on screen does
             // not vanish because the network went away for a moment.
             status.latest_version = cached.latest;
-            status.latest_cli_version = cached.latest_cli;
+            status.latest_cli_version = engine_latest.unwrap_or(cached.latest_cli);
             status.checked_at = (cached.checked_at > 0).then_some(cached.checked_at);
             status.failure_stage = Some(FailureStage::Check);
             status.error = Some(scrub(&err.to_string()));
@@ -437,9 +463,9 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
 /// The global CLI's `(installed, latest, code)` from the `result` line of
 /// `codeburn update --check --cli --json`. None when no result came back: a CLI that predates
 /// the engine, which is then offered nothing.
-fn engine_cli_check(
-    lines: &[serde_json::Value],
-) -> Option<(Option<String>, Option<String>, String)> {
+type EngineCli = (Option<String>, Option<String>, String);
+
+fn engine_cli_check(lines: &[serde_json::Value]) -> Option<EngineCli> {
     let result = lines.iter().rev().find(|line| line["type"] == "result")?;
     let cli = &result["components"]["cli"];
     let text = |key: &str| cli[key].as_str().map(str::to_owned);
@@ -450,11 +476,10 @@ fn engine_cli_check(
     ))
 }
 
-/// The Store branch's CLI check. A fresh cache answers `latest` and `--local` (no network)
-/// reads what is installed, so opening the popover does not cost an npm registry hit.
-async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStatus) {
-    let cached = read_cache().unwrap_or_default();
-    let fresh = !force && is_fresh(cached.checked_at);
+/// `codeburn update --check --cli --json`. With a fresh cache the cache answers `latest` and
+/// `--local` (no network) reads what is installed, so opening the popover does not cost an npm
+/// registry hit.
+async fn engine_cli_query(cli: &CodeburnCli, fresh: bool) -> Option<EngineCli> {
     let args: &[&str] = if fresh {
         &["--check", "--local", "--cli"]
     } else {
@@ -471,7 +496,30 @@ async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStat
     {
         crate::log_line!("codeburn: CLI update check failed: {err}");
     }
-    apply_store_cli_check(status, engine_cli_check(&lines), fresh, &cached);
+    engine_cli_check(&lines)
+}
+
+/// The global CLI's latest from the engine: npm's, or the formula for a Homebrew CLI. A CLI
+/// bundled with another app (`managed`) is offered nothing. `known` stands when the cache is
+/// fresh (`--local` reports only the running CLI's own version), when the registry did not
+/// answer, and when no result came back at all.
+fn engine_latest_cli(
+    answer: Option<&EngineCli>,
+    fresh: bool,
+    known: Option<String>,
+) -> Option<String> {
+    match answer {
+        Some((_, _, code)) if code == "managed" => None,
+        Some((_, Some(latest), _)) if !fresh => Some(latest.clone()),
+        _ => known,
+    }
+}
+
+/// The Store branch's CLI check.
+async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStatus) {
+    let cached = read_cache().unwrap_or_default();
+    let fresh = !force && is_fresh(cached.checked_at);
+    apply_store_cli_check(status, engine_cli_query(cli, fresh).await, fresh, &cached);
     if !fresh && status.latest_cli_version.is_some() && status.checked_at.is_none() {
         let checked_at = now_secs();
         let entry = Cached {
@@ -490,7 +538,7 @@ async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStat
 /// a registry that could not be read keeps whatever the cache knew.
 fn apply_store_cli_check(
     status: &mut UpdateStatus,
-    check: Option<(Option<String>, Option<String>, String)>,
+    check: Option<EngineCli>,
     fresh: bool,
     cached: &Cached,
 ) {
@@ -875,6 +923,80 @@ mod tests {
         );
         assert!(!status.cli_update_available);
         assert_eq!(status.installed_cli_version, None);
+    }
+
+    #[test]
+    fn only_a_cli_from_0_9_27_is_asked_through_the_engine() {
+        assert!(!uses_engine(None));
+        assert!(!uses_engine(Some("0.9.26")));
+        assert!(uses_engine(Some("0.9.27")));
+        assert!(uses_engine(Some("0.10.0")));
+    }
+
+    /// The 0.9.26 release order: GitHub had `v0.9.27` before npm did. The engine answers with
+    /// npm, so nothing is offered until the click can install it.
+    #[test]
+    fn an_engine_cli_takes_npm_latest_not_the_github_release() {
+        let releases: Vec<GitHubRelease> = serde_json::from_value(serde_json::json!([
+            {"tag_name": "v0.9.27", "assets": []}
+        ]))
+        .unwrap();
+        let answer = (
+            Some("0.9.26".to_owned()),
+            Some("0.9.26".to_owned()),
+            "up_to_date".to_owned(),
+        );
+        let latest_cli = |engine_latest: Option<Option<String>>| {
+            let mut status = UpdateStatus::new("0.9.27".into());
+            status.installed_cli_version = Some("0.9.26".into());
+            status.latest_cli_version =
+                engine_latest.unwrap_or_else(|| resolve_latest_cli_version(&releases));
+            status.recompute();
+            status
+        };
+
+        let engine = latest_cli(Some(engine_latest_cli(Some(&answer), false, None)));
+        assert_eq!(engine.latest_cli_version.as_deref(), Some("0.9.26"));
+        assert!(!engine.cli_update_available);
+
+        let older = latest_cli(None);
+        assert_eq!(older.latest_cli_version.as_deref(), Some("0.9.27"));
+        assert!(older.cli_update_available);
+    }
+
+    #[test]
+    fn engine_latest_keeps_the_cache_unless_the_registry_answered() {
+        let known = || Some("0.9.27".to_owned());
+        let answer = |latest: Option<&str>, code: &str| {
+            (
+                Some("0.9.26".to_owned()),
+                latest.map(str::to_owned),
+                code.to_owned(),
+            )
+        };
+
+        let npm = answer(Some("0.9.28"), "ok");
+        assert_eq!(
+            engine_latest_cli(Some(&npm), false, known()).as_deref(),
+            Some("0.9.28")
+        );
+        // `--local` reports the running CLI's own version, not npm's.
+        assert_eq!(
+            engine_latest_cli(Some(&npm), true, known()).as_deref(),
+            Some("0.9.27")
+        );
+        let offline = answer(None, "download_fail");
+        assert_eq!(
+            engine_latest_cli(Some(&offline), false, known()).as_deref(),
+            Some("0.9.27")
+        );
+        assert_eq!(
+            engine_latest_cli(None, false, known()).as_deref(),
+            Some("0.9.27")
+        );
+        let bundled = answer(None, "managed");
+        assert_eq!(engine_latest_cli(Some(&bundled), false, known()), None);
+        assert_eq!(engine_latest_cli(Some(&bundled), true, known()), None);
     }
 
     /// This test binary is an ordinary .exe, which is the branch every developer machine and
