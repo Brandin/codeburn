@@ -376,6 +376,17 @@ describe('runUpdate --json contract', () => {
     expect(f.events()[1]).toMatchObject({ components: { cli: { installed: '0.9.25', latest: '0.9.26', code: 'ok' } } })
   })
 
+  it('brew: up to date reports the formula as cli.latest', async () => {
+    const f = fake({
+      findGlobalCli: async () => ({ ...npmCli('0.9.26'), method: 'brew', root: '/opt/homebrew/Cellar/codeburn/0.9.26/libexec/lib/node_modules/codeburn' }),
+      npmLatest: '0.9.26',
+      brewFormula: '0.9.26',
+    })
+    expect(await runUpdate({ components: ['cli'], check: true, json: true }, f.deps)).toBe(0)
+    expect(f.events()[1]).toMatchObject({ components: { cli: { latest: '0.9.26', code: 'up_to_date', method: 'brew' } } })
+    expect(f.runs.some(r => r[1] === 'info')).toBe(true)
+  })
+
   it('pnpm, bun and volta get no_manager with their own command', async () => {
     const f = fake({ findGlobalCli: async () => ({ ...npmCli('0.9.25'), method: 'pnpm' }) })
     expect(await runUpdate({ components: ['cli'], json: true }, f.deps)).toBe(1)

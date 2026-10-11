@@ -263,33 +263,37 @@ export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promi
       }
       latest = viewed
     }
-    if (versionAtLeast(cli.version, latest)) {
-      finish('cli', 'skipped', 'up_to_date', `CLI ${cli.version} is up to date.`, { ...base, latest })
-      return null
-    }
 
+    let brew: string | null = null
     if (cli.method === 'brew' && !options.local) {
-      const brew = await deps.findExecutable('brew', dirname(cli.launcher))
+      brew = await deps.findExecutable('brew', dirname(cli.launcher))
       const info = brew
         ? await deps.run(brew, ['info', '--json=v2', 'codeburn'], { timeoutMs: BREW_INFO_TIMEOUT_MS, env: { ...process.env, HOMEBREW_NO_AUTO_UPDATE: '1' } })
         : null
       let formula: string | null = null
       try { formula = JSON.parse(info?.stdout ?? '').formulae?.[0]?.versions?.stable ?? null } catch {}
-      if (!brew || !info || !formula) {
+      if (!info || !formula) {
         finish('cli', 'error', info ? classifyCommandFailure(info, 'install_fail') : 'no_manager',
           'Could not read the Homebrew formula version.', { ...base, latest: null })
         return null
       }
-      if (versionAtLeast(cli.version, formula)) {
+      if (versionAtLeast(cli.version, formula) && !versionAtLeast(formula, latest)) {
         finish('cli', 'skipped', 'managed', `Homebrew has not published ${latest} yet.`, { ...base, latest: formula })
         return null
       }
+      latest = formula
+    }
+    if (versionAtLeast(cli.version, latest)) {
+      finish('cli', 'skipped', 'up_to_date', `CLI ${cli.version} is up to date.`, { ...base, latest })
+      return null
+    }
+    if (brew) {
       if (check) {
-        finish('cli', 'skipped', 'ok', `CLI ${formula} is available from Homebrew.`, { ...base, latest: formula })
+        finish('cli', 'skipped', 'ok', `CLI ${latest} is available from Homebrew.`, { ...base, latest })
         return null
       }
-      emit({ type: 'step', component: 'cli', state: 'start', from: cli.version ?? undefined, to: formula, message: `Updating CLI to ${formula} with Homebrew...` })
-      return afterInstall(cli, await deps.run(brew, ['upgrade', 'codeburn'], { timeoutMs: INSTALL_TIMEOUT_MS }), formula, formula)
+      emit({ type: 'step', component: 'cli', state: 'start', from: cli.version ?? undefined, to: latest, message: `Updating CLI to ${latest} with Homebrew...` })
+      return afterInstall(cli, await deps.run(brew, ['upgrade', 'codeburn'], { timeoutMs: INSTALL_TIMEOUT_MS }), latest, latest)
     }
 
     if (check) {
