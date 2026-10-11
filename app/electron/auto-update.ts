@@ -1,6 +1,6 @@
 // One-click updates through electron-updater, reading the fixed update-feeds release rather
 // than GitHub's /releases/latest, which four release lines share. Nothing downloads until the
-// reader clicks; the next click restarts into the new version.
+// reader clicks; once the download lands the app restarts into the new version on its own.
 
 import { compareSemver, type UpdateChecker, type UpdateStatus } from './updates'
 
@@ -23,6 +23,14 @@ export function autoUpdateSupported(env: {
   if (env.platform === 'linux') return Boolean(env.appImage)
   if (env.platform === 'win32') return WINDOWS_AUTO_UPDATE && !env.windowsStore
   return false
+}
+
+/** The generic feed a test build reads instead of the baked one, from CODEBURN_RELEASE_BASE.
+ *  Only a loopback server or a GitHub releases download base is accepted; anything else is ignored. */
+export function releaseFeedOverride(base: string | undefined): string | null {
+  if (!base) return null
+  if (!/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(base) && !/^https:\/\/github\.com\/[\w-][\w.-]*\/[\w-][\w.-]*\/releases\/download$/.test(base)) return null
+  return `${base}/update-feeds`
 }
 
 export type Updater = {
@@ -57,6 +65,9 @@ export function createAutoUpdateChecker(opts: {
   /** Called when the update is downloaded and again just before quitting into it: from then
    *  on it installs, at the latest on the next quit. */
   onInstall?: (from: string, to: string) => void
+  /** Runs before quitAndInstall: the quit flush, done here because a before-quit handler that
+   *  defers the quit would cancel the one quitAndInstall starts. */
+  beforeQuit?: () => Promise<void>
 }): AutoUpdateChecker {
   const { updater, currentVersion, onChange } = opts
   const now = opts.now ?? (() => Date.now())
@@ -65,13 +76,24 @@ export function createAutoUpdateChecker(opts: {
   let status: UpdateStatus = { currentVersion, latestVersion: null, updateAvailable: false, tag: null }
   let lastCheckedAt = 0
   let inflight: Promise<UpdateStatus> | null = null
+  let installing = false
 
   const set = (next: UpdateStatus) => { status = next; onChange(status) }
 
+  const install = async () => {
+    if (status.install !== 'ready' || installing) return
+    installing = true
+    opts.onInstall?.(currentVersion, status.latestVersion ?? '')
+    try { await opts.beforeQuit?.() } catch { /* the install goes ahead without the flush */ }
+    updater.quitAndInstall()
+  }
+
+  // Nothing downloads without a click (or the hand-off from another surface), so a finished
+  // download restarts straight into the update; `ready` is what the banner shows meanwhile.
   updater.on('update-downloaded', () => {
     if (status.install !== 'downloading') return
-    opts.onInstall?.(currentVersion, status.latestVersion ?? '')
     set({ ...status, install: 'ready' })
+    void install()
   })
 
   const check = (): Promise<UpdateStatus> => {
@@ -118,10 +140,6 @@ export function createAutoUpdateChecker(opts: {
       }
       return status
     },
-    install() {
-      if (status.install !== 'ready') return
-      opts.onInstall?.(currentVersion, status.latestVersion ?? '')
-      updater.quitAndInstall()
-    },
+    install() { void install() },
   }
 }

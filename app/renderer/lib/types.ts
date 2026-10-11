@@ -1187,6 +1187,27 @@ export type UpdateStatus = {
   install?: 'available' | 'downloading' | 'ready'
 }
 
+export type CompanionComponent = 'cli' | 'menubar'
+
+/** One component's latest step from the CLI's `codeburn update --json` engine. */
+export type CompanionStep = {
+  state: 'start' | 'progress' | 'done' | 'skipped' | 'error'
+  code?: string
+  from?: string
+  to?: string
+  message?: string
+  /** The manual fallback the engine names on an error. */
+  command?: string
+}
+
+/** The menubar app and global CLI against the desktop's version (app/electron/companion-update.ts). */
+export type CompanionUpdateStatus = {
+  state: 'idle' | 'available' | 'running' | 'done' | 'error'
+  version: string
+  behind: CompanionComponent[]
+  steps: Partial<Record<CompanionComponent, CompanionStep>>
+}
+
 /** The tray app and the Capacity Dock the Windows desktop app bundles (app/electron/menubar.ts).
  *  `supported` is false everywhere else, and on a Windows build with nothing staged. */
 export type CompanionStatus = {
@@ -1304,6 +1325,10 @@ export interface CodeburnBridge {
   downloadUpdate?(): Promise<UpdateStatus>
   /** Quit and install a downloaded update. */
   installUpdate?(): Promise<void>
+  /** The menubar app and global CLI update; absent on bridges without companions. */
+  getCompanionUpdate?(): Promise<CompanionUpdateStatus | null>
+  onCompanionUpdate?(cb: (status: CompanionUpdateStatus) => void): () => void
+  updateCompanions?(): Promise<boolean>
   getQuota(force?: boolean, disabled?: ProviderName[]): Promise<QuotaProvider[]>
   // `background` (prefetch only) requests background CLI-spawn priority; optional
   // so an older preload that ignores it degrades to interactive priority.
