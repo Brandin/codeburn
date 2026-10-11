@@ -332,7 +332,8 @@ final class UpdateChecker {
     }
 
     func checkIfNeeded() async {
-        guard !isUpdating else { return }
+        // A background check would wipe an update failure the user has not acted on yet.
+        guard !isUpdating, updateFailureStage == nil || updateFailureStage == .check else { return }
         installedCliVersion = await Task.detached { Self.queryInstalledCliVersion() }.value
         let stamp = Self.checkStamp(app: currentVersion, cli: installedCliVersion)
         if Self.isCheckFresh(
