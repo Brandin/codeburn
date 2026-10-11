@@ -464,6 +464,22 @@ struct UpdateEngineProgressTests {
         #expect(checker.updateError == "killed")
     }
 
+    @Test("a stream cut short after the menubar was placed is not a failure; the marker stays for the relaunch")
+    func cutAfterMenubarDone() {
+        let (defaults, suiteName) = TestDefaults.make("codeburn.update-engine.cut")
+        defer { TestDefaults.forget(suiteName) }
+        let checker = UpdateChecker(defaults: defaults)
+        checker.isUpdating = true
+        checker.handleEngineStep(step("menubar", "start", extra: #","to":"0.9.28""#))
+        checker.handleEngineStep(step("menubar", "done", extra: #","code":"ok","to":"0.9.28""#))
+        checker.handleEngineStep(step("desktop", "start"))
+        checker.finishEngineUpdate(status: 1, stderr: "")
+        #expect(!checker.isUpdating)
+        #expect(checker.updateFailureStage == nil)
+        #expect(checker.updateError == nil)
+        #expect((defaults.dictionary(forKey: "UpdateChecker.pendingUpdate") as? [String: String])?["to"] == "0.9.28")
+    }
+
     @Test("the menubar step drives the pending marker and its telemetry")
     func menubarTelemetry() {
         let (defaults, suiteName) = TestDefaults.make("codeburn.update-engine.marker")

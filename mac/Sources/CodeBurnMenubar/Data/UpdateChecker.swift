@@ -222,6 +222,8 @@ final class UpdateChecker {
     /// The engine's manual fallback for the failed step, when it gave one.
     var updateFailureCommand: String?
     @ObservationIgnored private var engineFailure: UpdateEngineLine?
+    /// The engine reported the menubar placed; the installer relaunches this app next.
+    @ObservationIgnored private var menubarReplaced = false
 
     var updateBadgeLabel: String {
         if isUpdating {
@@ -668,6 +670,7 @@ final class UpdateChecker {
         updateFailureCommand = nil
         updatingComponent = nil
         engineFailure = nil
+        menubarReplaced = false
         // Main-queue hops keep the lines in order; unstructured Tasks would not promise that.
         Self.runEngine(["--all", "--json"], timeoutSeconds: engineUpdateTimeoutSeconds, onLine: { [weak self] line in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.handleEngineStep(line) } }
@@ -685,6 +688,8 @@ final class UpdateChecker {
             if component == "menubar", line.state == "start", let to = line.to {
                 defaults.set(["from": AppVersion.normalize(currentVersion), "to": AppVersion.normalize(to)], forKey: pendingUpdateKey)
             }
+        case "done":
+            if component == "menubar" { menubarReplaced = true }
         case "skipped":
             if component == "menubar" { defaults.removeObject(forKey: pendingUpdateKey) }
         case "error":
@@ -707,7 +712,9 @@ final class UpdateChecker {
             NSLog("CodeBurn: update failed at \(failure.component ?? "?") (\(failure.code ?? "?")): \(message)")
             return
         }
-        guard status == 0 else {
+        // Once the menubar is placed the relaunch can stop this app or cut the stream before the
+        // final result; the pending marker settles the outcome in the relaunched copy.
+        guard status == 0 || menubarReplaced else {
             updateFailureStage = Self.failureStage(component: lastComponent)
             updateError = stderr.isEmpty ? L("Update failed (exit %lld)", status) : stderr
             NSLog("CodeBurn: update failed (exit \(status)): \(stderr)")
