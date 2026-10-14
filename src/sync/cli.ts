@@ -392,7 +392,7 @@ export function registerSyncCommands(program: Command): void {
         let attributionTotal = 0
         if (opts.attribution) {
           const { computeAttributionRecords } = await import('../yield.js')
-          const records = computeAttributionRecords(projects, range, process.cwd())
+          const records = await computeAttributionRecords(projects, range, process.cwd())
           const collected = collectUnsentAttribution(records)
           attributionUnsent = collected.unsent
           attributionTotal = collected.allItems.length
@@ -889,7 +889,7 @@ export function registerSyncCommands(program: Command): void {
         let attributionUnsent: Awaited<ReturnType<typeof collectUnsentAttribution>>['unsent'] = []
         if (accepted.attribution) {
           const { computeAttributionRecords } = await import('../yield.js')
-          const records = computeAttributionRecords(projects, range, process.cwd())
+          const records = await computeAttributionRecords(projects, range, process.cwd())
           const collected = collectUnsentAttribution(records)
           attributionUnsent = collected.unsent
         }

@@ -191,7 +191,7 @@ describe('computeAttributionRecords', () => {
         { project: 'app', projectPath: repoDir, sessions: [session] } as ProjectSummary,
       ]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
 
       expect(records).toHaveLength(1)
       const record = records[0]!
@@ -225,14 +225,14 @@ describe('computeAttributionRecords', () => {
         { project: 'app', projectPath: repoDir, sessions: [session] } as ProjectSummary,
       ]
 
-      expect(computeAttributionRecords(projects, range, repoDir)).toEqual([])
+      expect(await computeAttributionRecords(projects, range, repoDir)).toEqual([])
 
       // …and therefore nothing can be sent, even with prior ledger state for
       // this session (simulating an earlier wider---since push).
       const { writeLedger } = await import('../src/sync/ledger.js')
       writeLedger([{ key: 'attr:s:sess-idle:0123456789abcdef', ts: '2026-01-01T10:00:00.000Z' }])
       const { collectUnsentAttribution } = await import('../src/sync/push.js')
-      expect(collectUnsentAttribution(computeAttributionRecords(projects, range, repoDir)).unsent).toEqual([])
+      expect(collectUnsentAttribution(await computeAttributionRecords(projects, range, repoDir)).unsent).toEqual([])
     } finally {
       await rm(repoDir, { recursive: true, force: true })
     }
@@ -257,7 +257,7 @@ describe('computeAttributionRecords', () => {
         { project: 'app', projectPath: repoDir, sessions: [tight, broadLoser] } as ProjectSummary,
       ]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
       const loser = records.find(r => r.sessionId === 'sess-broad-loser')!
       // The loser IS emitted (retraction candidate: lostCandidacy) with zero
       // commits — the sync layer decides whether a prior state warrants
@@ -289,7 +289,7 @@ describe('computeAttributionRecords', () => {
         { project: 'app', projectPath: repoDir, sessions: [withPr, withoutPr] } as ProjectSummary,
       ]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
 
       // sess-pr wins the commit window but has no repo identity, so commits
       // are dropped; the PR link alone justifies the record. sess-nopr has
@@ -333,7 +333,7 @@ describe('computeAttributionRecords', () => {
         { project: 'real', projectPath: cwdRepo, sessions: [genuine] },
       ] as ProjectSummary[]
 
-      const records = computeAttributionRecords(projects, range, cwdRepo)
+      const records = await computeAttributionRecords(projects, range, cwdRepo)
 
       // orphan-nopr: nothing joinable -> no record at all
       expect(records.find(r => r.sessionId === 'orphan-nopr')).toBeUndefined()
@@ -376,7 +376,7 @@ describe('computeAttributionRecords', () => {
         { project: 'real', projectPath: cwdRepo, sessions: [genuineBroad] },
       ] as ProjectSummary[]
 
-      const records = computeAttributionRecords(projects, range, cwdRepo)
+      const records = await computeAttributionRecords(projects, range, cwdRepo)
 
       expect(records.find(r => r.sessionId === 'fallback-tight')!.commits).toEqual([])
       expect(records.find(r => r.sessionId === 'genuine-broad')!.commits).toHaveLength(1)
@@ -404,7 +404,7 @@ describe('computeAttributionRecords', () => {
         { project: 'app', projectPath: repoDir, sessions: [tight, broad] } as ProjectSummary,
       ]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
 
       // Both sessions get records (the loser is a retraction candidate),
       // but the commit is awarded exactly once — to the tighter window.
@@ -431,7 +431,7 @@ describe('computeAttributionRecords', () => {
       })
       const projects = [{ project: 'profile', projectPath: repoDir, sessions: [session] }] as ProjectSummary[]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
       expect(records).toHaveLength(1)
       expect(records[0]).toMatchObject({ repo: null, commits: [] })
       expect(JSON.stringify(records)).not.toContain('secret-org')
@@ -452,7 +452,7 @@ describe('computeAttributionRecords', () => {
       })
       const projects = [{ project: 'local-label', projectPath: repoDir, sessions: [session] }] as ProjectSummary[]
 
-      const records = computeAttributionRecords(projects, range, repoDir)
+      const records = await computeAttributionRecords(projects, range, repoDir)
       expect(records).toHaveLength(1)
       expect(records[0]).toMatchObject({ repo: null, commits: [] })
       expect(JSON.stringify(records)).not.toContain('secret-org')

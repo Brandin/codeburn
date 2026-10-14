@@ -1,6 +1,7 @@
-import { execFileSync } from 'child_process'
+import { execFile } from 'child_process'
 import { realpathSync } from 'fs'
 import { resolve } from 'path'
+import { promisify } from 'util'
 import { cachedProjectIdentitiesForRange } from './daily-cache.js'
 import { reportUnmatchedProjectPatterns } from './project-filter-warnings.js'
 import { filterProjectsByName, parseAllSessions } from './parser.js'
@@ -57,11 +58,26 @@ type SessionYieldJson = Omit<SessionYield, 'cost'> & {
 
 const SAFE_REF_PATTERN = /^[A-Za-z0-9._/\-]+$/
 
-function runGit(args: string[], cwd: string): string | null {
+const execFileAsync = promisify(execFile)
+
+// Callers fan out per repo, directory and ref; one global cap keeps that from
+// spawning hundreds of git processes at once (each spawn is slow on Windows).
+const GIT_CONCURRENCY = 8
+let gitRunning = 0
+const gitWaiting: Array<() => void> = []
+
+async function runGit(args: string[], cwd: string): Promise<string | null> {
+  if (gitRunning < GIT_CONCURRENCY) gitRunning++
+  else await new Promise<void>(resolve => gitWaiting.push(resolve))
   try {
-    return execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
+    const { stdout } = await execFileAsync('git', args, { cwd, encoding: 'utf-8' })
+    return stdout.trim()
   } catch {
     return null
+  } finally {
+    const next = gitWaiting.shift()
+    if (next) next()
+    else gitRunning--
   }
 }
 
@@ -97,40 +113,38 @@ function canonicalPath(path: string): string {
  */
 function resolveRepoIdentity(
   dir: string,
-  cache: Map<string, RepoIdentity | null>,
-): RepoIdentity | null {
+  cache: Map<string, Promise<RepoIdentity | null>>,
+): Promise<RepoIdentity | null> {
   const cached = cache.get(dir)
   if (cached !== undefined) return cached
 
-  let identity: RepoIdentity | null = null
   // One fork answers both questions; line 1 is --is-inside-work-tree, line 2 the
   // --git-common-dir (relative to `dir` for a subdir, absolute for a worktree).
-  const out = runGit(['rev-parse', '--is-inside-work-tree', '--git-common-dir'], dir)
-  if (out) {
+  const identity = runGit(['rev-parse', '--is-inside-work-tree', '--git-common-dir'], dir).then(out => {
+    if (!out) return null
     const [insideWorkTree, commonDir] = out.split('\n')
-    if (insideWorkTree === 'true' && commonDir) {
-      // realpath canonicalizes symlinks: git reports a linked worktree's
-      // common-dir as a realpath but the main worktree's as ".git" relative to
-      // its (possibly symlinked) path, so both must be canonicalized to collapse
-      // to one key.
-      // Accepted residual: moving the main repo after `git worktree add` leaves
-      // Git's linked-worktree metadata stale, so its worktrees may not unify;
-      // that is Git-state staleness, not a grouping bug.
-      identity = { key: canonicalPath(resolve(dir, commonDir)), gitDir: dir }
-    }
-  }
+    if (insideWorkTree !== 'true' || !commonDir) return null
+    // realpath canonicalizes symlinks: git reports a linked worktree's
+    // common-dir as a realpath but the main worktree's as ".git" relative to
+    // its (possibly symlinked) path, so both must be canonicalized to collapse
+    // to one key.
+    // Accepted residual: moving the main repo after `git worktree add` leaves
+    // Git's linked-worktree metadata stale, so its worktrees may not unify;
+    // that is Git-state staleness, not a grouping bug.
+    return { key: canonicalPath(resolve(dir, commonDir)), gitDir: dir }
+  })
   cache.set(dir, identity)
   return identity
 }
 
-function getMainBranch(cwd: string): string {
-  const result = runGit(['symbolic-ref', 'refs/remotes/origin/HEAD'], cwd)
+async function getMainBranch(cwd: string): Promise<string> {
+  const result = await runGit(['symbolic-ref', 'refs/remotes/origin/HEAD'], cwd)
   if (result) {
     const branch = result.replace('refs/remotes/origin/', '')
     if (SAFE_REF_PATTERN.test(branch)) return branch
   }
 
-  const branches = runGit(['branch', '-a'], cwd) ?? ''
+  const branches = await runGit(['branch', '-a'], cwd) ?? ''
   if (branches.includes('main')) return 'main'
   if (branches.includes('master')) return 'master'
   return 'main'
@@ -222,8 +236,8 @@ export function normalizeRemoteUrl(url: string): string | null {
 }
 
 /** `git remote get-url origin`, normalized. Null when absent or local-only. */
-function getRepoRemote(gitDir: string): string | null {
-  const url = runGit(['remote', 'get-url', 'origin'], gitDir)
+async function getRepoRemote(gitDir: string): Promise<string | null> {
+  const url = await runGit(['remote', 'get-url', 'origin'], gitDir)
   return url ? normalizeRemoteUrl(url) : null
 }
 
@@ -259,8 +273,8 @@ type SessionAttribution = {
  *    session whose work was being reverted — so the original session always
  *    looked productive even after its work was thrown away.
  */
-function getRevertedShas(cwd: string): Set<string> {
-  const bodies = runGit(
+async function getRevertedShas(cwd: string): Promise<Set<string>> {
+  const bodies = await runGit(
     ['log', '--all', '--grep=^This reverts commit', '--format=%B%x1e'],
     cwd,
   ) ?? ''
@@ -273,21 +287,22 @@ function getRevertedShas(cwd: string): Set<string> {
   return set
 }
 
-function getCommitsInRange(cwd: string, since: Date, until: Date, mainBranch: string): CommitInfo[] {
+async function getCommitsInRange(cwd: string, since: Date, until: Date, mainBranch: string): Promise<CommitInfo[]> {
   const sinceStr = since.toISOString()
   const untilStr = until.toISOString()
 
-  const log = runGit(
+  const log = await runGit(
     ['log', '--all', `--since=${sinceStr}`, `--until=${untilStr}`, '--format=%H|%aI|%s'],
     cwd
   )
 
   if (!log) return []
 
-  const mainCommits = new Set(
-    (runGit(['log', mainBranch, '--format=%H'], cwd) ?? '').split('\n').filter(Boolean)
-  )
-  const revertedShas = getRevertedShas(cwd)
+  const [mainLog, revertedShas] = await Promise.all([
+    runGit(['log', mainBranch, '--format=%H'], cwd),
+    getRevertedShas(cwd),
+  ])
+  const mainCommits = new Set((mainLog ?? '').split('\n').filter(Boolean))
 
   return log.split('\n').filter(Boolean).map(line => {
     const [sha] = line.split('|')
@@ -375,34 +390,45 @@ type MergedBranchIndex = {
  * it calls dead work shipped — on one real corpus, 567 of 600 first-draft
  * rescues came from exactly one such parked ref.
  */
-function buildMergedBranchIndex(
+async function buildMergedBranchIndex(
   gitDir: string,
   mainBranch: string,
   wanted: ReadonlySet<string>,
-): MergedBranchIndex | null {
+): Promise<MergedBranchIndex | null> {
   if (wanted.size === 0) return null
 
-  const mainLog = runGit(['log', mainBranch, '--format=%T'], gitDir) ?? ''
-  const mainTrees = new Set(mainLog.split('\n').filter(Boolean))
+  const [mainLog, refList] = await Promise.all([
+    runGit(['log', mainBranch, '--format=%T'], gitDir),
+    runGit(['for-each-ref', 'refs/heads', 'refs/remotes', '--format=%(refname:short)%09%(tree)'], gitDir),
+  ])
+  const mainTrees = new Set((mainLog ?? '').split('\n').filter(Boolean))
 
   // Collect EVERY matching ref per branch name: a stale local copy that does
   // not qualify must not hide a remote-tracking ref that does (and vice
   // versa), so all candidates become evidence rather than first-wins.
-  const allRefs = (runGit(['for-each-ref', 'refs/heads', 'refs/remotes', '--format=%(refname:short)'], gitDir) ?? '')
-    .split('\n').map(l => l.trim()).filter(Boolean)
+  const allRefs = (refList ?? '').split('\n').map(l => l.trim()).filter(Boolean).map(l => l.split('\t'))
+  const refEvidence = async (ref: string, listedTree: string | undefined): Promise<BranchEvidence | null> => {
+    // %(tree) is empty when the ref does not point at a commit; rev-parse peels it.
+    const tree = listedTree || await runGit(['rev-parse', `${ref}^{tree}`], gitDir)
+    if (!tree) return null
+    const base = await runGit(['merge-base', ref, mainBranch], gitDir)
+    const [baseTree, ownLog] = base
+      ? await Promise.all([
+        runGit(['rev-parse', `${base}^{tree}`], gitDir),
+        runGit(['log', '--format=%aI', `${base}..${ref}`], gitDir).then(out => out ?? ''),
+      ])
+      : [null, '']
+    const commitDates = ownLog.split('\n').filter(Boolean).map(d => new Date(d))
+    return { ref, tree, baseTree, commitDates }
+  }
+  // The main branch's own evidence is never read (sessionBranchShipped skips it).
+  const wantedBranches = [...wanted].filter(branch => branch !== mainBranch)
+  const evidenceByBranch = await Promise.all(wantedBranches.map(branch => Promise.all(
+    allRefs.filter(([ref]) => refMatchesSessionBranch(ref!, branch)).map(([ref, tree]) => refEvidence(ref!, tree)),
+  )))
   const branches = new Map<string, BranchEvidence[]>()
-  for (const branch of wanted) {
-    const evidence: BranchEvidence[] = []
-    for (const ref of allRefs) {
-      if (!refMatchesSessionBranch(ref, branch)) continue
-      const tree = runGit(['rev-parse', `${ref}^{tree}`], gitDir)
-      if (!tree) continue
-      const base = runGit(['merge-base', ref, mainBranch], gitDir)
-      const baseTree = base ? runGit(['rev-parse', `${base}^{tree}`], gitDir) : null
-      const ownLog = base ? runGit(['log', '--format=%aI', `${base}..${ref}`], gitDir) ?? '' : ''
-      const commitDates = ownLog.split('\n').filter(Boolean).map(d => new Date(d))
-      evidence.push({ ref, tree, baseTree, commitDates })
-    }
+  for (const [i, branch] of wantedBranches.entries()) {
+    const evidence = evidenceByBranch[i]!.filter((e): e is BranchEvidence => e !== null)
     if (evidence.length > 0) branches.set(branch, evidence)
   }
 
@@ -515,6 +541,8 @@ type RepoGroup = {
   ownIdentity: boolean[]
   /** A directory to run further git queries in (remote lookup); null when the group has no git identity. */
   gitDir: string | null
+  /** getMainBranch(gitDir); null exactly when gitDir is. */
+  mainBranch: Promise<string> | null
 }
 
 type RepoIdentityMode = 'project-path' | 'trusted-session-cwd'
@@ -528,44 +556,63 @@ type RepoIdentityMode = 'project-path' | 'trusted-session-cwd'
  * to one group; a project whose path is missing or not a git repo falls back
  * to the cwd repo (or an empty commit list when cwd is not a repo either).
  */
-function buildRepoGroups(
+async function buildRepoGroups(
   projects: ProjectSummary[],
   range: DateRange,
   cwd: string,
   identityMode: RepoIdentityMode = 'project-path',
-): Map<string, RepoGroup> {
-  const repoIdentityCache = new Map<string, RepoIdentity | null>()
+): Promise<Map<string, RepoGroup>> {
+  const repoIdentityCache = new Map<string, Promise<RepoIdentity | null>>()
+  const mainBranches = new Map<string, Promise<string>>()
+  const mainBranchOf = (dir: string): Promise<string> => {
+    let branch = mainBranches.get(dir)
+    if (!branch) mainBranches.set(dir, branch = getMainBranch(dir))
+    return branch
+  }
+  const commitsIn = (dir: string): Promise<CommitInfo[]> =>
+    mainBranchOf(dir).then(main => getCommitsInRange(dir, range.start, range.end, main))
+  const sourcePathOf = (project: ProjectSummary, session: SessionSummary): string | undefined =>
+    identityMode === 'trusted-session-cwd' ? session.workingDirectory : project.projectPath
 
-  const cwdIdentity = resolveRepoIdentity(cwd, repoIdentityCache)
-  const cwdCommits = cwdIdentity
-    ? getCommitsInRange(cwd, range.start, range.end, getMainBranch(cwd))
-    : []
-
-  const repoGroups = new Map<string, RepoGroup>()
+  // Resolve every distinct directory concurrently up front; the grouping loop
+  // below then only reads the cache, in the original session order.
   for (const project of projects) {
     for (const session of project.sessions) {
-      const sourcePath = identityMode === 'trusted-session-cwd'
-        ? session.workingDirectory
-        : project.projectPath
+      const sourcePath = sourcePathOf(project, session)
+      if (isTrustedAbsoluteWorkingDirectory(sourcePath)) void resolveRepoIdentity(sourcePath, repoIdentityCache)
+    }
+  }
+  const cwdIdentity = await resolveRepoIdentity(cwd, repoIdentityCache)
+  let cwdCommits: Promise<CommitInfo[]> | undefined
+
+  const repoGroups = new Map<string, RepoGroup>()
+  const pendingCommits: Promise<void>[] = []
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const sourcePath = sourcePathOf(project, session)
       const ownIdentity = isTrustedAbsoluteWorkingDirectory(sourcePath)
-        ? resolveRepoIdentity(sourcePath, repoIdentityCache)
+        ? await resolveRepoIdentity(sourcePath, repoIdentityCache)
         : null
       const identity = ownIdentity ?? cwdIdentity
       const groupKey = identity ? identity.key : cwd
 
       let group = repoGroups.get(groupKey)
       if (!group) {
-        group = {
-          commits: !identity
-            ? []
-            : cwdIdentity && identity.key === cwdIdentity.key
-              ? cwdCommits
-              : getCommitsInRange(identity.gitDir, range.start, range.end, getMainBranch(identity.gitDir)),
+        const newGroup: RepoGroup = {
+          commits: [],
           sessions: [],
           projectNames: [],
           ownIdentity: [],
           gitDir: identity?.gitDir ?? null,
+          mainBranch: identity ? mainBranchOf(identity.gitDir) : null,
         }
+        if (identity) {
+          const commits = cwdIdentity && identity.key === cwdIdentity.key
+            ? cwdCommits ??= commitsIn(cwd)
+            : commitsIn(identity.gitDir)
+          pendingCommits.push(commits.then(loaded => { newGroup.commits = loaded }))
+        }
+        group = newGroup
         repoGroups.set(groupKey, group)
       }
       group.sessions.push(session)
@@ -574,6 +621,7 @@ function buildRepoGroups(
     }
   }
 
+  await Promise.all(pendingCommits)
   return repoGroups
 }
 
@@ -591,32 +639,33 @@ export async function computeYield(range: DateRange, cwd: string, provider: stri
     details: [],
   }
 
-  const repoGroups = buildRepoGroups(projects, range, cwd)
+  const repoGroups = await buildRepoGroups(projects, range, cwd)
 
-  for (const group of repoGroups.values()) {
+  const categorizedGroups = [...repoGroups.values()].map(group => {
     const attributions = attributeCommits(group.sessions, group.commits)
+    const categorized = group.sessions.map((session, index) => categorizeSession(
+      session,
+      attributions[index]?.commits ?? [],
+      attributions[index]?.lostCandidacy ?? false,
+    ))
     // All branch names observed across this group's sessions, so one index
-    // covers every session; built lazily below only if a rescue is attempted.
+    // covers every session; built only when some session is a rescue candidate.
     const groupBranches = new Set<string>()
     for (const session of group.sessions) {
       for (const branch of sessionBranches(session)) groupBranches.add(branch)
     }
-    let mergedBranchIndex: MergedBranchIndex | null | undefined
-    const rescueIfShipped = (session: SessionSummary, branches: ReadonlySet<string>): boolean => {
-      if (groupBranches.size === 0 || !group.gitDir) return false
-      if (mergedBranchIndex === undefined) {
-        mergedBranchIndex = buildMergedBranchIndex(group.gitDir, getMainBranch(group.gitDir), groupBranches)
-      }
-      return mergedBranchIndex !== null && sessionBranchShipped(session, branches, mergedBranchIndex)
-    }
+    const { gitDir, mainBranch } = group
+    const rescueCandidate = categorized.some(c => c.category === 'abandoned' || c.category === 'ambiguous')
+    const mergedBranchIndex = rescueCandidate && groupBranches.size > 0 && gitDir && mainBranch
+      ? mainBranch.then(main => buildMergedBranchIndex(gitDir, main, groupBranches))
+      : Promise.resolve(null)
+    return { group, categorized, mergedBranchIndex }
+  })
 
+  for (const { group, categorized, mergedBranchIndex: pendingIndex } of categorizedGroups) {
+    const mergedBranchIndex = await pendingIndex
     for (const [index, session] of group.sessions.entries()) {
-      const attribution = attributions[index]
-      let { category, commitCount } = categorizeSession(
-        session,
-        attribution?.commits ?? [],
-        attribution?.lostCandidacy ?? false,
-      )
+      let { category, commitCount } = categorized[index]!
       // #1442: the timestamp-window heuristics call work abandoned that later
       // shipped — a squash merge lands the work under a SHA the window can
       // never see. When the session was observed on a branch whose tip tree is
@@ -624,7 +673,7 @@ export async function computeYield(range: DateRange, cwd: string, provider: stri
       // session's work demonstrably shipped and it is productive. Reverted
       // stays reverted: that verdict already describes shipped-then-undone.
       if (category === 'abandoned' || category === 'ambiguous') {
-        if (rescueIfShipped(session, sessionBranches(session))) {
+        if (mergedBranchIndex !== null && sessionBranchShipped(session, sessionBranches(session), mergedBranchIndex)) {
           category = 'productive'
         }
       }
@@ -799,16 +848,18 @@ export function sanitizePrLinks(links: string[]): string[] {
  * Takes already-parsed projects (sync push has them in hand) instead of
  * re-parsing like computeYield does.
  */
-export function computeAttributionRecords(
+export async function computeAttributionRecords(
   projects: ProjectSummary[],
   range: DateRange,
   cwd: string,
-): SessionAttributionRecord[] {
-  const repoGroups = buildRepoGroups(projects, range, cwd, 'trusted-session-cwd')
+): Promise<SessionAttributionRecord[]> {
+  const repoGroups = await buildRepoGroups(projects, range, cwd, 'trusted-session-cwd')
+  const groups = [...repoGroups.values()]
+  const remotes = await Promise.all(groups.map(group => group.gitDir ? getRepoRemote(group.gitDir) : null))
   const records: SessionAttributionRecord[] = []
 
-  for (const group of repoGroups.values()) {
-    const remote = group.gitDir ? getRepoRemote(group.gitDir) : null
+  for (const [groupIndex, group] of groups.entries()) {
+    const remote = remotes[groupIndex] ?? null
 
     // Privacy gate: only sessions whose identity came from their own explicit
     // provider-recorded cwd participate in commit attribution. A session whose cwd no
