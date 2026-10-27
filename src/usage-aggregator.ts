@@ -755,8 +755,9 @@ export type IndexedDurableOverview = {
  * Project a dashboard headline from one normalized lifetime index. Existing
  * durable cache days remain authoritative (so expired transcripts do not
  * disappear); normalized days fill only dates the durable cache does not yet
- * contain, which is the cold first-index case. Today always comes from the
- * live normalized index. No parser is called here.
+ * contain, which is the cold first-index case. A provider-scoped index
+ * overlays its days the way buildDurablePeriod does. Today always comes from
+ * the live normalized index. No parser is called here.
  */
 export function buildDurableOverviewFromNormalizedIndex(
   periodInfo: PeriodInfo,
@@ -805,20 +806,12 @@ export function buildDurableOverviewFromNormalizedIndex(
       )
     : []
   const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
-  const normalizedByDate = new Map(normalizedDays.map(day => [day.date, day]))
-  const days = excludeGatewayFromDays(pf === 'all' ? allDays : allDays.map(day => {
-    if (Object.hasOwn(day.providers, pf)) return sliceDayToProvider(day, pf)
-    const normalized = normalizedByDate.get(day.date)
-    // The shared cache can be complete for a date while lacking this selected
-    // provider's slice (for example, Claude was cached before Codex appeared).
-    // Fill only that absent slice from the provider-scoped normalized index.
-    // An existing slice is authoritative unless the live parse explains more of
-    // it (the reconcile above), which retains carried/expired money and prevents
-    // the surviving source from being counted twice.
-    return normalized && Object.hasOwn(normalized.providers, pf)
-      ? sliceDayToProvider(normalized, pf)
-      : sliceDayToProvider(day, pf)
-  }), pf)
+  // The shared cache can be complete yet predate this provider's sources, so a
+  // provider-scoped index applies the same overlay as buildDurablePeriod: the
+  // headline then matches report and the first paint after every refresh.
+  const days = excludeGatewayFromDays(pf === 'all'
+    ? allDays
+    : overlayProviderDaySlices(allDays, normalizedDays.filter(day => day.date >= rangeStartStr && day.date <= rangeEndStr), pf), pf)
   const data = buildPeriodDataFromDays(days, periodInfo.label)
 
   // Fields whose durable day rows cannot project under a project filter come
