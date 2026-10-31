@@ -702,7 +702,7 @@ export function Dock() {
   useEffect(() => {
     if (!prefsLoaded || quota.fetchedAt === null) return
     const connected = quota.providers.filter((p) => p.available).map((p) => p.id)
-    const patch = autoSeed(prefs, connected)
+    const patch = autoSeed(prefs, connected, quota.providers.map((p) => p.id))
     if (patch) void writeDockPrefs(patch).then(setPrefs)
   }, [prefsLoaded, quota, prefs])
 

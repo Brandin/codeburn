@@ -171,13 +171,17 @@ function cappedIds(ids: string[]): string[] {
 /// the rail stay, in their current order, so one quota refresh that misses Codex cannot
 /// replace the rail with Cursor and leave that as the saved choice. Returns the patch to
 /// write, or null when there is nothing to do.
-export function autoSeed(prefs: DockPrefs, connected: string[]): Partial<DockPrefs> | null {
+export function autoSeed(prefs: DockPrefs, connected: string[], known?: string[]): Partial<DockPrefs> | null {
   if (prefs.manualSelection) return null
   // Nothing connected yet is a reason to wait, not a reason to empty the dock.
   if (connected.length === 0 && prefs.providers.length === 0) return null
   // A resting provider that this refresh did not report is kept at the front of the
-  // candidates so the cap cannot drop it to make room for whoever did answer.
-  const pinned = prefs.preferred !== null && !prefs.providers.includes(prefs.preferred)
+  // candidates so the cap cannot drop it to make room for whoever did answer. Only one the
+  // CLI reads: a rail of separate Claude rings also saves its profile row id as the resting
+  // choice, and that id is not a provider.
+  const pinned = prefs.preferred !== null
+    && !prefs.providers.includes(prefs.preferred)
+    && (known?.includes(prefs.preferred) ?? true)
     ? [prefs.preferred]
     : []
   const desired = cappedIds([...pinned, ...prefs.providers, ...connected])

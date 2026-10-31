@@ -34,6 +34,11 @@ describe('Capacity Dock auto-seed', () => {
     expect(autoSeed(current, ['cursor'])).toEqual({ providers: ['codex', 'cursor'] })
   })
 
+  it('does not put a Claude profile row saved as the resting choice onto the rail', () => {
+    const current = prefs({ providers: ['claude', 'codex'], preferred: 'claude-config:0123456789abcdef' })
+    expect(autoSeed(current, ['claude', 'codex'], ['claude', 'codex'])).toBeNull()
+  })
+
   it('seeds a fresh rail from whoever is connected and rests on the first', () => {
     expect(autoSeed(prefs(), ['codex', 'cursor'])).toEqual({
       providers: ['codex', 'cursor'],
